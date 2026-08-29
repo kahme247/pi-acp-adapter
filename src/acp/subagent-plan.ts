@@ -43,7 +43,7 @@ export function subagentDetailsToPlanEntries(details: SubagentDetails): PlanEntr
     const prefix = r.step ? `Step ${r.step}: ` : ''
     const agent = r.agent || 'subagent'
     const task = formatTask(r.task || '')
-    const failed = r.exitCode !== 0 && r.exitCode !== -1
+    const failed = typeof r.exitCode === 'number' && r.exitCode !== 0 && r.exitCode !== -1
     const icon = failed ? '✗ ' : status === 'completed' ? '✓ ' : status === 'in_progress' ? '⏳ ' : ''
     const content = task ? `${icon}${prefix}${agent}: ${task}` : `${icon}${prefix}${agent}`
     return {

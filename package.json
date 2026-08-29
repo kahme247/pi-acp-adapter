@@ -33,7 +33,8 @@
     "pi-agent": "dist/index.js"
   },
   "files": [
-    "dist"
+    "dist",
+    "icon.svg"
   ],
   "scripts": {
     "dev": "tsx src/index.ts",
