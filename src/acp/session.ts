@@ -13,6 +13,11 @@ import { readFileSync } from 'node:fs'
 import { isAbsolute, resolve as resolvePath } from 'node:path'
 import { PiRpcProcess, PiRpcSpawnError, type PiRpcEvent, type PiSessionStats } from '../pi-rpc/process.js'
 import { extractRpivTasks, rpivTasksToPlanEntries } from './rpiv-todo.js'
+import {
+  extractSubagentDetails,
+  subagentArgsToPlanEntries,
+  subagentDetailsToPlanEntries
+} from './subagent-plan.js'
 import { maybeAuthRequiredError } from './auth-required.js'
 import { SessionStore } from './session-store.js'
 import { expandSlashCommand, type FileSlashCommand } from './slash-commands.js'
@@ -335,6 +340,7 @@ export class PiAcpSession {
   private fileMutationToolCallIds = new Set<string>()
   private bashToolCallIds = new Set<string>()
   private bashOutputSnapshots = new Map<string, string>()
+  private subagentToolCallIds = new Set<string>()
 
   // Ensure `session/update` notifications are sent in order and can be awaited
   // before completing a `session/prompt` request.
@@ -624,6 +630,7 @@ export class PiAcpSession {
     this.fileMutationToolCallIds.delete(toolCallId)
     this.bashToolCallIds.delete(toolCallId)
     this.bashOutputSnapshots.delete(toolCallId)
+    this.subagentToolCallIds.delete(toolCallId)
   }
 
   private startTurn(t: QueuedTurn): void {
@@ -852,6 +859,13 @@ export class PiAcpSession {
           break
         }
 
+        // subagent bar: translate subagent args into ACP plan pane (like todo)
+        if (toolName === 'subagent') {
+          this.subagentToolCallIds.add(toolCallId)
+          const entries = subagentArgsToPlanEntries(args)
+          if (entries) this.emit({ sessionUpdate: 'plan', entries } as SessionUpdate)
+        }
+
         // Capture pre-mutation file contents so we can emit a structured ACP diff.
         const isFileMutation = toolName === 'edit' || toolName === 'write'
         let snapshotOldText: string | null | undefined
@@ -913,6 +927,14 @@ export class PiAcpSession {
         if (this.bashToolCallIds.has(toolCallId)) {
           this.emitBashOutputUpdate({ toolCallId, status: 'in_progress', result: partial })
           break
+        }
+
+        if (this.subagentToolCallIds.has(toolCallId)) {
+          const details = extractSubagentDetails(partial)
+          if (details) {
+            const entries = subagentDetailsToPlanEntries(details)
+            if (entries.length) this.emit({ sessionUpdate: 'plan', entries } as SessionUpdate)
+          }
         }
 
         const isFileMutation = this.fileMutationToolCallIds.has(toolCallId)
@@ -994,6 +1016,14 @@ export class PiAcpSession {
           if (tasks) {
             const entries = rpivTasksToPlanEntries(tasks)
             this.emit({ sessionUpdate: 'plan', entries } as SessionUpdate)
+          }
+        }
+        // subagent bar: translate subagent results into ACP plan pane (like todo)
+        if (toolNameForPlan === 'subagent') {
+          const details = extractSubagentDetails(result)
+          if (details) {
+            const entries = subagentDetailsToPlanEntries(details)
+            if (entries.length) this.emit({ sessionUpdate: 'plan', entries } as SessionUpdate)
           }
         }
 
