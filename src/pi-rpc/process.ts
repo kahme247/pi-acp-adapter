@@ -214,7 +214,13 @@ export class PiRpcProcess {
       const parsed = extraPiArgs.match(/(?:[^\s"']+|"[^"]*"|'[^']*')+/g) ?? []
       for (const tok of parsed) {
         const stripped = tok.replace(/^"(.*)"$/, '$1').replace(/^'(.*)'$/, '$1')
-        if (stripped) args.push(stripped)
+        if (!stripped) continue
+        // Harden: when shell:true on Windows, args are concatenated not escaped
+        // (DEP0190). Block shell metachars in extra args to prevent injection.
+        if (shouldUseShellForPiCommand(cmd) && /[&|;$`(){}\[\]<>]/.test(stripped)) {
+          throw new Error(`PI_ACP_PI_ARGS contains unsafe shell characters: ${stripped}`)
+        }
+        args.push(stripped)
       }
     }
     let childEnv: NodeJS.ProcessEnv = process.env

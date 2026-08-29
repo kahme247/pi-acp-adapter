@@ -341,6 +341,8 @@ export class PiAcpSession {
   private bashToolCallIds = new Set<string>()
   private bashOutputSnapshots = new Map<string, string>()
   private subagentToolCallIds = new Set<string>()
+  private lastTodoEntries: import('@agentclientprotocol/sdk').PlanEntry[] | null = null
+  private lastSubagentEntries: import('@agentclientprotocol/sdk').PlanEntry[] | null = null
 
   // Ensure `session/update` notifications are sent in order and can be awaited
   // before completing a `session/prompt` request.
@@ -633,6 +635,15 @@ export class PiAcpSession {
     this.subagentToolCallIds.delete(toolCallId)
   }
 
+  private emitMergedPlan(): void {
+    const entries = [...(this.lastTodoEntries ?? []), ...(this.lastSubagentEntries ?? [])]
+    if (entries.length === 0) {
+      this.emit({ sessionUpdate: 'plan', entries: [] } as SessionUpdate)
+      return
+    }
+    this.emit({ sessionUpdate: 'plan', entries } as SessionUpdate)
+  }
+
   private startTurn(t: QueuedTurn): void {
     this.cancelRequested = false
     this.inAgentLoop = false
@@ -863,7 +874,10 @@ export class PiAcpSession {
         if (toolName === 'subagent') {
           this.subagentToolCallIds.add(toolCallId)
           const entries = subagentArgsToPlanEntries(args)
-          if (entries) this.emit({ sessionUpdate: 'plan', entries } as SessionUpdate)
+          if (entries) {
+            this.lastSubagentEntries = entries
+            this.emitMergedPlan()
+          }
         }
 
         // Capture pre-mutation file contents so we can emit a structured ACP diff.
@@ -933,7 +947,10 @@ export class PiAcpSession {
           const details = extractSubagentDetails(partial)
           if (details) {
             const entries = subagentDetailsToPlanEntries(details)
-            if (entries.length) this.emit({ sessionUpdate: 'plan', entries } as SessionUpdate)
+            if (entries.length) {
+              this.lastSubagentEntries = entries
+              this.emitMergedPlan()
+            }
           }
         }
 
@@ -1014,8 +1031,8 @@ export class PiAcpSession {
         if (toolNameForPlan === 'todo') {
           const tasks = extractRpivTasks(result)
           if (tasks) {
-            const entries = rpivTasksToPlanEntries(tasks)
-            this.emit({ sessionUpdate: 'plan', entries } as SessionUpdate)
+            this.lastTodoEntries = rpivTasksToPlanEntries(tasks)
+            this.emitMergedPlan()
           }
         }
         // subagent bar: translate subagent results into ACP plan pane (like todo)
@@ -1023,7 +1040,10 @@ export class PiAcpSession {
           const details = extractSubagentDetails(result)
           if (details) {
             const entries = subagentDetailsToPlanEntries(details)
-            if (entries.length) this.emit({ sessionUpdate: 'plan', entries } as SessionUpdate)
+            if (entries.length) {
+              this.lastSubagentEntries = entries
+              this.emitMergedPlan()
+            }
           }
         }
 

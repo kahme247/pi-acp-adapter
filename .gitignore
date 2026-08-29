@@ -4,6 +4,13 @@ node_modules
 dist
 *.log
 
+# secrets / env
+.env
+.env.*
+*.npmrc
+.npmrc
+pi-acp-adapter-*.tgz
+
 # ESLint cache
 .eslintcache
 

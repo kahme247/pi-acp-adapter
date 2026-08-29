@@ -1,4 +1,4 @@
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { chmodSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { dirname } from 'node:path'
 import { getPiAcpSessionMapPath } from './paths.js'
 
@@ -15,7 +15,10 @@ type SessionMapFile = {
 }
 
 function ensureParentDir(path: string) {
-  mkdirSync(dirname(path), { recursive: true })
+  mkdirSync(dirname(path), { recursive: true, mode: 0o700 })
+  try {
+    chmodSync(dirname(path), 0o700)
+  } catch {}
 }
 
 function loadFile(path: string): SessionMapFile {
@@ -33,7 +36,10 @@ function loadFile(path: string): SessionMapFile {
 
 function saveFile(path: string, data: SessionMapFile): void {
   ensureParentDir(path)
-  writeFileSync(path, JSON.stringify(data, null, 2) + '\n', 'utf-8')
+  writeFileSync(path, JSON.stringify(data, null, 2) + '\n', { encoding: 'utf-8', mode: 0o600 })
+  try {
+    chmodSync(path, 0o600)
+  } catch {}
 }
 
 export class SessionStore {

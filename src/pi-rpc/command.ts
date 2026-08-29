@@ -5,7 +5,15 @@ export function defaultPiCommand(): string {
 }
 
 export function getPiCommand(override?: string): string {
-  return override ?? defaultPiCommand()
+  const cmd = override ?? defaultPiCommand()
+  // Harden: reject shell metachars that could be injected via PI_ACP_PI_COMMAND
+  // when shouldUseShellForPiCommand enables shell:true on Windows.
+  // Allowed: alphanumerics, path separators, ., -, _, :, ~, @, space (will be quoted)
+  // Block: & | ; $ ` ( ) { } < > \n \r
+  if (override && /[&|;$`(){}\[\]<>\n\r]/.test(override)) {
+    throw new Error(`PI_ACP_PI_COMMAND contains unsafe shell characters: ${override}`)
+  }
+  return cmd
 }
 
 export function shouldUseShellForPiCommand(cmd: string): boolean {
