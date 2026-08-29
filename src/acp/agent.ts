@@ -28,6 +28,11 @@ import { SessionStore } from './session-store.js'
 import { PiRpcProcess } from '../pi-rpc/process.js'
 import { listPiSessions, findPiSession } from './pi-sessions.js'
 import { normalizePiAssistantText, normalizePiMessageText } from './translate/pi-messages.js'
+
+function shouldExpandToolCalls(): boolean {
+  const v = process.env.PI_ACP_EXPAND_TOOL_CALLS
+  return v === 'true' || v === '1' || v === 'expand'
+}
 import { toolResultToText } from './translate/pi-tools.js'
 import {
   bashCommand,
@@ -1216,6 +1221,7 @@ export class PiAcpAgent implements ACPAgent {
         }
 
         // Create a synthetic ACP tool call to render historic tool usage.
+        const expandHistoric = shouldExpandToolCalls()
         await this.conn.sessionUpdate({
           sessionId: session.sessionId,
           update: {
@@ -1224,20 +1230,19 @@ export class PiAcpAgent implements ACPAgent {
             title: toolName,
             kind: toolName === 'read' ? 'read' : toolName === 'write' || toolName === 'edit' ? 'edit' : 'other',
             status: 'completed',
-            rawInput: null,
-            rawOutput: m
+            ...(expandHistoric ? { rawInput: null, rawOutput: m } : {})
           }
         })
 
-        const text = toolResultToText(m)
+        const text = expandHistoric ? toolResultToText(m) : ''
         await this.conn.sessionUpdate({
           sessionId: session.sessionId,
           update: {
             sessionUpdate: 'tool_call_update',
             toolCallId,
             status: isError ? 'failed' : 'completed',
-            content: text ? [{ type: 'content', content: { type: 'text', text } }] : null,
-            rawOutput: m
+            ...(text ? { content: [{ type: 'content', content: { type: 'text', text } }] } : {}),
+            ...(expandHistoric ? { rawOutput: m } : {})
           }
         })
       }

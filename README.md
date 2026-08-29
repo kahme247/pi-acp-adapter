@@ -11,10 +11,11 @@ MVP intended to be useful today and easy to iterate on. Some ACP features are no
 ## Features
 
 - **Streaming** — assistant `text_delta` → `agent_message_chunk`, reasoning `thinking_delta` → `agent_thought_chunk` (with `PI_ACP_THINK_HOLD_MS` coalescing so quick thoughts don't interleave with streamed text).
-- **Tool calls** — pi `tool_execution_*` + streamed `toolcall_*` → ACP `tool_call` / `tool_call_update` (monotonic `pending` → `in_progress` → `completed/failed`, never downgrades):
+- **Tool calls** — pi `tool_execution_*` + streamed `toolcall_*` → ACP `tool_call` / `tool_call_update` (monotonic `pending` → `in_progress` → `completed/failed`, never downgrades). **Start collapsed** (title + location only) — click to expand for details:
   - Locations resolved against session `cwd` (absolute paths) so clients like Zed can follow-along / open the file. For `edit`, a pre-edit file snapshot is used to infer a 1-based `line` when `oldText` is unique.
-  - `edit`/`write` → structured `diff` content (`oldText`/`newText` with `path`) when possible, instead of plain text.
-  - `bash` → ACP terminal content (`terminal` + `terminal-output`/`terminal-exit` meta) with live output delta.
+  - `edit`/`write` → structured `diff` content (`oldText`/`newText` with `path`) — Zed respects `agent.expand_edit_card` (set `false` to start collapsed).
+  - `bash` → ACP terminal content (`terminal` + `terminal-output`/`terminal-exit` meta) with live output delta — Zed respects `agent.expand_terminal_card`.
+  - Other tools (e.g. `read`) → collapsed by default (no inline file content / `rawInput`/`rawOutput`); set `PI_ACP_EXPAND_TOOL_CALLS=true` to show full details inline.
   - `todo` (rpiv) → ACP `plan` entries.
 - **Session persistence & history** — pi owns sessions at `~/.pi/agent/sessions/...` (or `$PI_CODING_AGENT_DIR` / `$PI_SESSIONS_DIR` overrides). The adapter keeps a small mapping at `~/.pi/pi-acp/session-map.json` (or `$PI_ACP_DATA_DIR`) so `session/load` can reattach. Also supports:
   - `session/list` with `cwd` filtering (defaults to last session `cwd` when client sends no filter, matching pi's `/resume` picker) and cursor pagination (`nextCursor`, page 50).
@@ -113,15 +114,16 @@ npm run build
 
 ### Environment variables
 
-| Variable                               | Default        | Effect                                                                                                                                                        |
-| -------------------------------------- | -------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `PI_ACP_PI_COMMAND`                    | `pi`           | Override the pi executable / absolute path.                                                                                                                   |
-| `PI_ACP_PI_ARGS` / `PI_ACP_EXTRA_ARGS` | —              | Extra args appended when spawning pi.                                                                                                                         |
-| `PI_ACP_DATA_DIR`                      | `~/.pi/pi-acp` | Adapter data dir (`session-map.json` lives here).                                                                                                             |
-| `PI_CODING_AGENT_DIR`                  | `~/.pi/agent`  | Pi agent dir (`settings.json`, `sessions/`, `prompts/`, `extensions/`). Also respects `PI_SESSIONS_DIR` / `PI_AGENT_SESSIONS_DIR` for sessions.               |
-| `PI_ACP_ENABLE_EMBEDDED_CONTEXT`       | `false`        | When `true`, advertises `promptCapabilities.embeddedContext`. When false, clients should avoid `resource` blocks — if sent anyway they degrade to plain text. |
-| `PI_ACP_CHECK_FOR_UPDATES`             | `true`         | Set `false` to disable the 800ms npm update check in startup info.                                                                                            |
-| `PI_ACP_THINK_HOLD_MS`                 | `200`          | Hold window (ms) for coalescing text after a `thinking_delta`. `0` disables holding.                                                                          |
+| Variable                               | Default        | Effect                                                                                                                                                                                                                                                   |
+| -------------------------------------- | -------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `PI_ACP_PI_COMMAND`                    | `pi`           | Override the pi executable / absolute path.                                                                                                                                                                                                              |
+| `PI_ACP_PI_ARGS` / `PI_ACP_EXTRA_ARGS` | —              | Extra args appended when spawning pi.                                                                                                                                                                                                                    |
+| `PI_ACP_DATA_DIR`                      | `~/.pi/pi-acp` | Adapter data dir (`session-map.json` lives here).                                                                                                                                                                                                        |
+| `PI_CODING_AGENT_DIR`                  | `~/.pi/agent`  | Pi agent dir (`settings.json`, `sessions/`, `prompts/`, `extensions/`). Also respects `PI_SESSIONS_DIR` / `PI_AGENT_SESSIONS_DIR` for sessions.                                                                                                          |
+| `PI_ACP_ENABLE_EMBEDDED_CONTEXT`       | `false`        | When `true`, advertises `promptCapabilities.embeddedContext`. When false, clients should avoid `resource` blocks — if sent anyway they degrade to plain text.                                                                                            |
+| `PI_ACP_CHECK_FOR_UPDATES`             | `true`         | Set `false` to disable the 800ms npm update check in startup info.                                                                                                                                                                                       |
+| `PI_ACP_THINK_HOLD_MS`                 | `200`          | Hold window (ms) for coalescing text after a `thinking_delta`. `0` disables holding.                                                                                                                                                                     |
+| `PI_ACP_EXPAND_TOOL_CALLS`             | `false`        | When `true`/`1`/`expand`, tool calls include full `content`/`rawInput`/`rawOutput` (expanded inline). Default `false` keeps them collapsed (title + location only) — diff/terminal still sent but Zed shows them collapsed per `expand_*_card` settings. |
 
 Set them via the ACP client's `env` map, e.g. Zed `settings.json`:
 
@@ -146,6 +148,11 @@ Set them via the ACP client's `env` map, e.g. Zed `settings.json`:
 - `quietStartup: boolean` — suppress startup prelude (still shows update notice).
 - `enableSkillCommands: boolean` (also `skills.enableSkillCommands`) — expose skill commands as `/skill:*`.
 - `enabledModels: string[]` — filter for advertised models.
+
+### Zed settings (`settings.json` → `agent`)
+
+- `expand_edit_card: boolean` (default `true` in Zed) — when `false`, diff cards from `edit`/`write` start collapsed. Keep `false` to avoid showing full file diffs inline.
+- `expand_terminal_card: boolean` (default `true`) — when `false`, terminal cards from `bash` start collapsed.
 
 ## Slash commands
 

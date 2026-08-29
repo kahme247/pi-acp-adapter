@@ -29,6 +29,17 @@ import {
 } from './translate/bash.js'
 import { toolResultToText } from './translate/pi-tools.js'
 
+function shouldExpandToolCalls(): boolean {
+  const v = process.env.PI_ACP_EXPAND_TOOL_CALLS
+  if (v === 'true' || v === '1' || v === 'expand') return true
+  if (v === 'false' || v === '0' || v === 'collapsed') return false
+  return false
+}
+
+function shouldIncludeRawIO(): boolean {
+  return shouldExpandToolCalls()
+}
+
 type SessionCreateParams = {
   cwd: string
   mcpServers: McpServer[]
@@ -755,7 +766,7 @@ export class PiAcpSession {
                 kind: toToolKind(toolName),
                 status,
                 locations,
-                rawInput
+                ...(shouldIncludeRawIO() ? { rawInput } : {})
               })
             } else {
               // Best-effort: keep rawInput updated while args are streaming.
@@ -765,7 +776,7 @@ export class PiAcpSession {
                 toolCallId,
                 status,
                 locations,
-                rawInput
+                ...(shouldIncludeRawIO() ? { rawInput } : {})
               })
             }
           }
@@ -848,7 +859,7 @@ export class PiAcpSession {
             kind: toToolKind(toolName),
             status: 'in_progress',
             locations,
-            rawInput: args
+            ...(shouldIncludeRawIO() ? { rawInput: args } : {})
           })
         } else {
           this.currentToolCalls.set(toolCallId, 'in_progress')
@@ -857,7 +868,7 @@ export class PiAcpSession {
             toolCallId,
             status: 'in_progress',
             locations,
-            rawInput: args
+            ...(shouldIncludeRawIO() ? { rawInput: args } : {})
           })
         }
 
@@ -874,16 +885,18 @@ export class PiAcpSession {
           break
         }
 
-        const text = this.fileMutationToolCallIds.has(toolCallId) ? '' : toolResultToText(partial)
+        const isFileMutation = this.fileMutationToolCallIds.has(toolCallId)
+        const expand = shouldExpandToolCalls()
+        const text = isFileMutation ? '' : toolResultToText(partial)
 
         this.emit({
           sessionUpdate: 'tool_call_update',
           toolCallId,
           status: 'in_progress',
-          content: text
-            ? ([{ type: 'content', content: { type: 'text', text } }] satisfies ToolCallContent[])
-            : undefined,
-          ...(this.fileMutationToolCallIds.has(toolCallId) ? {} : { rawOutput: partial })
+          ...(expand && text
+            ? { content: [{ type: 'content', content: { type: 'text', text } }] satisfies ToolCallContent[] }
+            : {}),
+          ...(isFileMutation || !expand ? {} : { rawOutput: partial })
         })
         break
       }
@@ -905,7 +918,8 @@ export class PiAcpSession {
           break
         }
 
-        const text = toolResultToText(result)
+        const expand = shouldExpandToolCalls()
+        const text = expand ? toolResultToText(result) : ''
 
         const snapshot = this.fileSnapshots.get(toolCallId)
         let content: ToolCallContent[] | undefined
@@ -931,7 +945,7 @@ export class PiAcpSession {
           }
         }
 
-        if (!content && !hasStructuredDiff && text) {
+        if (expand && !content && !hasStructuredDiff && text) {
           content = [{ type: 'content', content: { type: 'text', text } }] satisfies ToolCallContent[]
         }
 
@@ -939,8 +953,8 @@ export class PiAcpSession {
           sessionUpdate: 'tool_call_update',
           toolCallId,
           status: isError ? 'failed' : 'completed',
-          content,
-          ...(hasStructuredDiff ? {} : { rawOutput: result })
+          ...(content ? { content } : {}),
+          ...(hasStructuredDiff || !expand ? {} : { rawOutput: result })
         })
 
         // rpiv-todo adapter: translate todo tool snapshot into ACP plan pane
