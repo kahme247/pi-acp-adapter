@@ -13,10 +13,18 @@ export type PiSessionListItem = {
 const DEFAULT_TAIL_BYTES = 256 * 1024
 const DEFAULT_HEAD_BYTES = 64 * 1024
 
+function expandTilde(p: string): string {
+  if (p === '~') return homedir()
+  if (p.startsWith('~/')) return join(homedir(), p.slice(2))
+  return p
+}
+
 function getPiAgentDir(): string {
   // pi supports overriding config dir via PI_CODING_AGENT_DIR.
   // See pi README.
-  return process.env.PI_CODING_AGENT_DIR ? resolve(process.env.PI_CODING_AGENT_DIR) : join(homedir(), '.pi', 'agent')
+  const raw = process.env.PI_CODING_AGENT_DIR
+  if (!raw) return join(homedir(), '.pi', 'agent')
+  return resolve(expandTilde(raw))
 }
 
 function readSessionDirFromSettings(agentDir: string): string | null {
@@ -29,14 +37,19 @@ function readSessionDirFromSettings(agentDir: string): string | null {
 
     const sessionDir = (data as Record<string, unknown>).sessionDir
     if (typeof sessionDir !== 'string' || !sessionDir.trim()) return null
-
-    return isAbsolute(sessionDir) ? sessionDir : resolve(agentDir, sessionDir)
+    const expanded = expandTilde(sessionDir.trim())
+    return isAbsolute(expanded) ? expanded : resolve(agentDir, expanded)
   } catch {
     return null
   }
 }
 
 export function getPiSessionsDir(): string {
+  const custom = process.env.PI_SESSIONS_DIR?.trim() || process.env.PI_AGENT_SESSIONS_DIR?.trim()
+  if (custom) {
+    const expanded = expandTilde(custom)
+    return isAbsolute(expanded) ? expanded : resolve(process.cwd(), expanded)
+  }
   const agentDir = getPiAgentDir()
   return readSessionDirFromSettings(agentDir) ?? join(agentDir, 'sessions')
 }

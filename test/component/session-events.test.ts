@@ -143,7 +143,7 @@ test('PiAcpSession: emits tool locations from pi path args', async () => {
 
   assert.equal(conn.updates.length, 1)
   assert.equal(conn.updates[0]!.update.sessionUpdate, 'tool_call')
-  assert.deepEqual((conn.updates[0]!.update as any).locations, [{ path: `${process.cwd()}/src/acp/session.ts` }])
+  assert.deepEqual((conn.updates[0]!.update as any).locations, [{ path: join(process.cwd(), 'src/acp/session.ts') }])
 })
 
 test('PiAcpSession: handles extension select via ACP permission request', async () => {
@@ -241,7 +241,7 @@ test('PiAcpSession: sends cancelled response when ACP confirm is cancelled', asy
   assert.deepEqual(proc.extensionUiResponses, [{ id: 'ui-5', cancelled: true }])
 })
 
-test('PiAcpSession: cancels unsupported input and editor extension UI requests with visible fallback', async () => {
+test('PiAcpSession: routes input and editor extension UI requests through elicitation', async () => {
   const conn = new FakeAgentSideConnection()
   const proc = new FakePiRpcProcess()
 
@@ -259,13 +259,12 @@ test('PiAcpSession: cancels unsupported input and editor extension UI requests w
 
   await new Promise(r => setTimeout(r, 0))
 
+  assert.equal(conn.elicitationRequests.length, 2)
   assert.deepEqual(proc.extensionUiResponses, [
-    { id: 'ui-3', cancelled: true },
-    { id: 'ui-4', cancelled: true }
+    { id: 'ui-3', value: 'my answer' },
+    { id: 'ui-4', value: 'my answer' }
   ])
-  assert.equal(conn.updates.length, 2)
-  assert.match((conn.updates[0]!.update as any).content.text, /input UI request is not supported/)
-  assert.match((conn.updates[1]!.update as any).content.text, /editor UI request is not supported/)
+  assert.equal(conn.updates.length, 0)
 })
 
 test('PiAcpSession: emits agent_message_chunk for auto_retry_start with attempt/maxAttempts and rounded delay', async () => {
@@ -476,7 +475,7 @@ test('PiAcpSession: preserves ordering when auto_retry_start is interleaved with
   )
 })
 
-test('PiAcpSession: emits streamed tool locations from pi path args', async () => {
+test('PiAcpSession: waits for streamed tool paths to complete before emitting locations', async () => {
   const conn = new FakeAgentSideConnection()
   const proc = new FakePiRpcProcess()
 
@@ -489,10 +488,26 @@ test('PiAcpSession: emits streamed tool locations from pi path args', async () =
     fileCommands: []
   })
 
+  const emitToolCall = (type: 'toolcall_start' | 'toolcall_delta', path: string) => {
+    proc.emit({
+      type: 'message_update',
+      assistantMessageEvent: {
+        type,
+        partial: {
+          content: [{ type: 'toolCall', id: 't1', name: 'write', arguments: { path } }]
+        },
+        contentIndex: 0
+      }
+    })
+  }
+
+  emitToolCall('toolcall_start', '/')
+  emitToolCall('toolcall_delta', '/tmp')
+  emitToolCall('toolcall_delta', '/tmp/test.txt')
   proc.emit({
     type: 'message_update',
     assistantMessageEvent: {
-      type: 'toolcall_start',
+      type: 'toolcall_end',
       toolCall: {
         id: 't1',
         name: 'write',
@@ -503,9 +518,13 @@ test('PiAcpSession: emits streamed tool locations from pi path args', async () =
 
   await new Promise(r => setTimeout(r, 0))
 
-  assert.equal(conn.updates.length, 1)
+  assert.equal(conn.updates.length, 4)
   assert.equal(conn.updates[0]!.update.sessionUpdate, 'tool_call')
-  assert.deepEqual((conn.updates[0]!.update as any).locations, [{ path: '/tmp/test.txt' }])
+  for (const update of conn.updates.slice(0, -1)) {
+    assert.equal((update.update as any).locations, undefined)
+  }
+  assert.equal(conn.updates[3]!.update.sessionUpdate, 'tool_call_update')
+  assert.deepEqual((conn.updates[3]!.update as any).locations, [{ path: '/tmp/test.txt' }])
 })
 
 test('PiAcpSession: emits edit tool line when oldText matches uniquely', async () => {

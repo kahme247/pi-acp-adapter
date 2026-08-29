@@ -21,7 +21,8 @@ type BashResultRecord = {
 }
 
 export function isBashTool(toolName: string): boolean {
-  return toolName.toLowerCase() === 'bash'
+  const lower = toolName.toLowerCase()
+  return lower === 'bash' || lower === 'powershell'
 }
 
 export function bashCommand(value: unknown): string | undefined {

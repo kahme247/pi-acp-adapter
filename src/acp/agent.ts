@@ -19,7 +19,6 @@ import {
   type SetSessionConfigOptionResponse,
   type SetSessionModeRequest,
   type SetSessionModeResponse,
-  type StopReason,
   type DeleteSessionRequest,
   type DeleteSessionResponse
 } from '@agentclientprotocol/sdk'
@@ -42,16 +41,18 @@ import {
 } from './translate/bash.js'
 import { promptToPiMessage } from './translate/prompt.js'
 import { loadSlashCommands, parseCommandArgs, toAvailableCommands } from './slash-commands.js'
-import { getAgentDir, getEnableSkillCommands, getQuietStartup } from './pi-settings.js'
+import { getAgentDir, getEnableSkillCommands, getEnabledModels, getQuietStartup } from './pi-settings.js'
 import { toAvailableCommandsFromPiGetCommands } from './pi-commands.js'
 import { maybeAuthRequiredError } from './auth-required.js'
+import { normalizeAdditionalDirectories } from './workspace-roots.js'
+import { getPiCommand } from '../pi-rpc/command.js'
 import { isAbsolute } from 'node:path'
 import { existsSync, readFileSync, realpathSync, readdirSync, statSync, unlinkSync } from 'node:fs'
 import type { AvailableCommand } from '@agentclientprotocol/sdk'
 import { join, dirname, basename } from 'node:path'
 import { spawnSync } from 'node:child_process'
 
-type ThinkingLevel = 'off' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh'
+type ThinkingLevel = 'off' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max'
 type AdvertisedModel = {
   modelId: string
   name: string
@@ -99,6 +100,24 @@ function builtinAvailableCommands(): AvailableCommand[] {
     {
       name: 'changelog',
       description: 'Show pi changelog'
+    },
+    {
+      name: 'fork',
+      description: 'Fork session from a previous message',
+      input: { hint: '<entryId>' }
+    },
+    {
+      name: 'clone',
+      description: 'Clone current session branch'
+    },
+    {
+      name: 'bash',
+      description: 'Run a shell command directly',
+      input: { hint: '<command>' }
+    },
+    {
+      name: 'reload',
+      description: 'Reload pi extensions and skills'
     }
   ]
 }
@@ -115,6 +134,23 @@ function mergeCommands(a: AvailableCommand[], b: AvailableCommand[]): AvailableC
   }
 
   return out
+}
+
+async function loadAvailableCommands(
+  proc: Pick<PiRpcProcess, 'getCommands'>,
+  fileCommands: ReturnType<typeof loadSlashCommands>,
+  enableSkillCommands: boolean
+): Promise<AvailableCommand[]> {
+  try {
+    const pi = await proc.getCommands()
+    const { commands } = toAvailableCommandsFromPiGetCommands(pi, {
+      enableSkillCommands,
+      includeExtensionCommands: false
+    })
+    return mergeCommands(commands, builtinAvailableCommands())
+  } catch {
+    return mergeCommands(toAvailableCommands(fileCommands), builtinAvailableCommands())
+  }
 }
 import { fileURLToPath } from 'node:url'
 
@@ -180,10 +216,13 @@ export class PiAcpAgent implements ACPAgent {
 
   private async restoreSession(
     sessionId: string,
-    opts?: { cwd?: string; mcpServers?: LoadSessionRequest['mcpServers'] }
+    opts?: { cwd?: string; mcpServers?: LoadSessionRequest['mcpServers']; additionalDirectories?: string[] }
   ): Promise<PiAcpSession> {
     const existing = this.sessions.maybeGet(sessionId)
-    if (existing) return existing
+    if (existing) {
+      if (typeof existing.proc.isAlive !== 'function' || existing.proc.isAlive()) return existing
+      this.sessions.close(sessionId)
+    }
 
     const inFlight = this.restoringSessions.get(sessionId)
     if (inFlight) return inFlight
@@ -201,7 +240,9 @@ export class PiAcpAgent implements ACPAgent {
         proc = await PiRpcProcess.spawn({
           cwd,
           sessionPath: stored.sessionFile,
-          piCommand: process.env.PI_ACP_PI_COMMAND
+          piCommand: process.env.PI_ACP_PI_COMMAND,
+          ...(opts?.additionalDirectories?.length ? { additionalDirectories: opts.additionalDirectories } : {}),
+          ...(opts?.mcpServers?.length ? { mcpServers: opts.mcpServers } : {})
         })
       } catch (e: any) {
         if (e?.name === 'PiRpcSpawnError') {
@@ -216,7 +257,8 @@ export class PiAcpAgent implements ACPAgent {
         mcpServers: opts?.mcpServers ?? [],
         conn: this.conn,
         proc,
-        fileCommands
+        fileCommands,
+        additionalDirectories: opts?.additionalDirectories
       })
 
       this.lastSessionCwd = cwd
@@ -241,9 +283,10 @@ export class PiAcpAgent implements ACPAgent {
 
     return {
       protocolVersion: requested === supportedVersion ? requested : supportedVersion,
+      _meta: { steering: { supported: true } },
       agentInfo: {
-        name: pkg.name ?? 'pi-acp',
-        title: 'pi ACP adapter',
+        name: pkg.name ?? 'pi-agent',
+        title: 'PI Agent',
         version: pkg.version ?? '0.0.0'
       },
       // Zed currently uses ClientCapabilities._meta["terminal-auth"] to decide whether to show
@@ -253,7 +296,7 @@ export class PiAcpAgent implements ACPAgent {
       }),
       agentCapabilities: {
         loadSession: true,
-        mcpCapabilities: { http: false, sse: false },
+        mcpCapabilities: { http: true, sse: true },
         promptCapabilities: {
           image: true,
           audio: false,
@@ -263,10 +306,38 @@ export class PiAcpAgent implements ACPAgent {
           // **UNSTABLE** ACP capability used by Zed's codex-acp adapter.
           // Enables a native session picker in clients that support it.
           list: {},
-          delete: {}
+          delete: {},
+          additionalDirectories: {}
         }
       }
     }
+  }
+
+  async extMethod(method: string, params: Record<string, unknown>): Promise<Record<string, unknown>> {
+    if (method === '_session/steering') {
+      const sessionId = params.sessionId
+      if (typeof sessionId !== 'string' || !sessionId) {
+        throw RequestError.invalidParams('_session/steering requires a sessionId')
+      }
+      const session = await this.restoreSession(sessionId)
+      const prompt = (Array.isArray(params.prompt) ? params.prompt : []) as any[]
+      const { message, images } = promptToPiMessage(prompt as any)
+      if (!session.hasPendingTurn) {
+        const meta = params._meta as { steering?: { idleBehavior?: string } } | undefined
+        if (meta?.steering?.idleBehavior === 'promptRequired') {
+          return { outcome: 'promptRequired', reason: 'noRunningTurn' }
+        }
+        this.prompt({ sessionId, prompt: prompt as any }).catch(() => {})
+        return { outcome: 'startedNewTurn' }
+      }
+      try {
+        await session.proc.steer(message, images)
+      } catch (e) {
+        throw RequestError.internalError({}, String((e as Error)?.message ?? e))
+      }
+      return { outcome: 'injected' }
+    }
+    throw RequestError.methodNotFound(method)
   }
 
   async newSession(params: NewSessionRequest) {
@@ -274,18 +345,20 @@ export class PiAcpAgent implements ACPAgent {
       throw RequestError.invalidParams(`cwd must be an absolute path: ${params.cwd}`)
     }
 
+    const additionalDirectories = normalizeAdditionalDirectories((params as any).additionalDirectories, params.cwd)
+
     this.lastSessionCwd = params.cwd
 
     const fileCommands = loadSlashCommands(params.cwd)
     const enableSkillCommands = getEnableSkillCommands(params.cwd)
 
-    // Pi doesn't support mcpServers, but we accept and store.
     const session = await this.sessions.create({
       cwd: params.cwd,
       mcpServers: params.mcpServers,
       conn: this.conn,
       fileCommands,
-      piCommand: process.env.PI_ACP_PI_COMMAND
+      piCommand: process.env.PI_ACP_PI_COMMAND,
+      additionalDirectories
     })
 
     // Fetch state + models once (parallel) to reduce startup latency.
@@ -348,7 +421,8 @@ export class PiAcpAgent implements ACPAgent {
 
     const { configOptions, models, modes } = await getSessionConfiguration(session.proc, {
       state,
-      availableModels
+      availableModels,
+      cwd: params.cwd
     })
 
     const quietStartup = getQuietStartup(params.cwd)
@@ -363,7 +437,8 @@ export class PiAcpAgent implements ACPAgent {
       : buildStartupInfo({
           cwd: params.cwd,
           fileCommands,
-          updateNotice
+          updateNotice,
+          additionalDirectories
         })
 
     if (preludeText)
@@ -392,38 +467,19 @@ export class PiAcpAgent implements ACPAgent {
     // it will still be emitted as the first chunk of the first prompt.
     if (preludeText) setTimeout(() => session.sendStartupInfoIfPending(), 0)
 
-    // Advertise slash commands (ACP: available_commands_update)
-    // Important: some clients (e.g. Zed) will ignore notifications for an unknown sessionId.
-    // So we must send this *after* the session/new response has been delivered.
+    // Finish the pi command probe before exposing the session so it cannot race the first prompt.
+    const availableCommands = await loadAvailableCommands(session.proc, fileCommands, enableSkillCommands)
     setTimeout(() => {
-      void (async () => {
-        try {
-          const pi = (await session.proc.getCommands()) as any
-          const { commands } = toAvailableCommandsFromPiGetCommands(pi, {
-            enableSkillCommands,
-            includeExtensionCommands: false
-          })
-
-          await this.conn.sessionUpdate({
-            sessionId: session.sessionId,
-            update: {
-              sessionUpdate: 'available_commands_update',
-              availableCommands: mergeCommands(commands, builtinAvailableCommands())
-            }
-          })
-          return
-        } catch {
-          // Fall back to file-based prompt templates (legacy behavior).
-        }
-
-        await this.conn.sessionUpdate({
+      void session.publishContextUsage()
+      void this.conn
+        .sessionUpdate({
           sessionId: session.sessionId,
           update: {
             sessionUpdate: 'available_commands_update',
-            availableCommands: mergeCommands(toAvailableCommands(fileCommands), builtinAvailableCommands())
+            availableCommands
           }
         })
-      })()
+        .catch(() => {})
     }, 0)
 
     return response
@@ -476,12 +532,20 @@ export class PiAcpAgent implements ACPAgent {
       }
 
       if (cmd === 'session') {
-        const stats = (await session.proc.getSessionStats()) as any
+        const [stats, state] = await Promise.all([
+          session.proc.getSessionStats().catch(() => null) as Promise<any>,
+          session.proc.getState().catch(() => null) as Promise<any>
+        ])
 
         const lines: string[] = []
-        if (stats?.sessionId) lines.push(`Session: ${stats.sessionId}`)
-        if (stats?.sessionFile) lines.push(`Session file: ${stats.sessionFile}`)
+        if (stats?.sessionId || state?.sessionId) lines.push(`Session: ${stats?.sessionId ?? state?.sessionId}`)
+        if (stats?.sessionFile || state?.sessionFile)
+          lines.push(`Session file: ${stats?.sessionFile ?? state?.sessionFile}`)
+        if (typeof state?.sessionName === 'string' && state.sessionName) lines.push(`Name: ${state.sessionName}`)
         if (typeof stats?.totalMessages === 'number') lines.push(`Messages: ${stats.totalMessages}`)
+        if (typeof state?.pendingMessageCount === 'number') lines.push(`Pending: ${state.pendingMessageCount}`)
+        if (typeof state?.isStreaming === 'boolean') lines.push(`Streaming: ${state.isStreaming}`)
+        if (typeof state?.isCompacting === 'boolean') lines.push(`Compacting: ${state.isCompacting}`)
 
         if (typeof stats?.cost === 'number') lines.push(`Cost: ${stats.cost}`)
 
@@ -658,11 +722,23 @@ export class PiAcpAgent implements ACPAgent {
       if (cmd === 'changelog') {
         // Read pi's installed CHANGELOG.md. Adapter-side, no model call.
         const findChangelog = (): string | null => {
+          const customPi = process.env.PI_ACP_PI_COMMAND?.trim()
+          if (customPi && isAbsolute(customPi) && existsSync(customPi)) {
+            try {
+              const resolved = realpathSync(customPi)
+              const pkgRoot = dirname(dirname(resolved))
+              const p = join(pkgRoot, 'CHANGELOG.md')
+              if (existsSync(p)) return p
+            } catch {
+              // ignore
+            }
+          }
           // 1) Locate the installed pi package by resolving the `pi` executable.
           // On Node installs, `pi` typically resolves to .../@earendil-works/pi-coding-agent/dist/cli.js
           try {
             const whichCmd = process.platform === 'win32' ? 'where' : 'which'
-            const which = spawnSync(whichCmd, ['pi'], { encoding: 'utf-8' })
+            const lookup = customPi && !isAbsolute(customPi) ? customPi : 'pi'
+            const which = spawnSync(whichCmd, [lookup], { encoding: 'utf-8' })
             const piPath = String(which.stdout ?? '')
               .split(/\r?\n/)[0]
               ?.trim()
@@ -880,16 +956,121 @@ export class PiAcpAgent implements ACPAgent {
 
         return { stopReason: 'end_turn' }
       }
+
+      if (cmd === 'bash') {
+        const command = args.join(' ').trim()
+        if (!command) {
+          await this.conn.sessionUpdate({
+            sessionId: session.sessionId,
+            update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'Usage: /bash <command>' } }
+          })
+          return { stopReason: 'end_turn' }
+        }
+        try {
+          const result: any = await session.proc.bash(command)
+          const output = typeof result?.output === 'string' ? result.output : JSON.stringify(result, null, 2)
+          await this.conn.sessionUpdate({
+            sessionId: session.sessionId,
+            update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: output || '(no output)' } }
+          })
+        } catch (e: any) {
+          await this.conn.sessionUpdate({
+            sessionId: session.sessionId,
+            update: {
+              sessionUpdate: 'agent_message_chunk',
+              content: { type: 'text', text: `bash failed: ${String(e?.message ?? e)}` }
+            }
+          })
+        }
+        return { stopReason: 'end_turn' }
+      }
+
+      if (cmd === 'fork') {
+        const entryId = String(args[0] ?? '').trim()
+        if (!entryId) {
+          const data: any = await session.proc.getForkMessages().catch(() => null)
+          const msgs = Array.isArray(data?.messages) ? data.messages : []
+          const text = msgs.length
+            ? msgs.map((m: any) => `${m.entryId}: ${String(m.text ?? '').slice(0, 80)}`).join('\n')
+            : 'No fork points'
+          await this.conn.sessionUpdate({
+            sessionId: session.sessionId,
+            update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text } }
+          })
+          return { stopReason: 'end_turn' }
+        }
+        try {
+          await session.proc.fork(entryId)
+          await this.conn.sessionUpdate({
+            sessionId: session.sessionId,
+            update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: `Forked from ${entryId}` } }
+          })
+        } catch (e: any) {
+          await this.conn.sessionUpdate({
+            sessionId: session.sessionId,
+            update: {
+              sessionUpdate: 'agent_message_chunk',
+              content: { type: 'text', text: `fork failed: ${String(e?.message ?? e)}` }
+            }
+          })
+        }
+        return { stopReason: 'end_turn' }
+      }
+
+      if (cmd === 'clone') {
+        try {
+          await session.proc.clone()
+          await this.conn.sessionUpdate({
+            sessionId: session.sessionId,
+            update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'Cloned current branch' } }
+          })
+        } catch (e: any) {
+          await this.conn.sessionUpdate({
+            sessionId: session.sessionId,
+            update: {
+              sessionUpdate: 'agent_message_chunk',
+              content: { type: 'text', text: `clone failed: ${String(e?.message ?? e)}` }
+            }
+          })
+        }
+        return { stopReason: 'end_turn' }
+      }
+
+      if (cmd === 'reload') {
+        try {
+          const fileCommands = loadSlashCommands(session.cwd)
+          const enableSkillCommands = getEnableSkillCommands(session.cwd)
+          const cmds = await loadAvailableCommands(session.proc, fileCommands, enableSkillCommands)
+          await this.conn.sessionUpdate({
+            sessionId: session.sessionId,
+            update: { sessionUpdate: 'available_commands_update', availableCommands: cmds }
+          })
+          await this.conn.sessionUpdate({
+            sessionId: session.sessionId,
+            update: {
+              sessionUpdate: 'agent_message_chunk',
+              content: { type: 'text', text: 'Reloaded extensions and skills' }
+            }
+          })
+        } catch (e: any) {
+          await this.conn.sessionUpdate({
+            sessionId: session.sessionId,
+            update: {
+              sessionUpdate: 'agent_message_chunk',
+              content: { type: 'text', text: `reload failed: ${String(e?.message ?? e)}` }
+            }
+          })
+        }
+        return { stopReason: 'end_turn' }
+      }
     }
 
-    const result = await session.prompt(message, images)
-
-    // ACP StopReason does not include "error"; if pi fails we map to end_turn for now,
-    // unless we know this was a cancellation.
-    const stopReason: StopReason =
-      result === 'error' ? (session.wasCancelRequested() ? 'cancelled' : 'end_turn') : result
-
-    return { stopReason }
+    try {
+      return { stopReason: await session.prompt(message, images) }
+    } catch (error) {
+      this.sessions.close(session.sessionId)
+      throw error
+    }
   }
 
   async cancel(params: CancelNotification): Promise<void> {
@@ -945,9 +1126,11 @@ export class PiAcpAgent implements ACPAgent {
     }
 
     const enableSkillCommands = getEnableSkillCommands(params.cwd)
+    const additionalDirectories = normalizeAdditionalDirectories((params as any).additionalDirectories, params.cwd)
     const session = await this.restoreSession(params.sessionId, {
       cwd: params.cwd,
-      mcpServers: params.mcpServers
+      mcpServers: params.mcpServers,
+      additionalDirectories
     })
     const proc = session.proc
     const fileCommands = loadSlashCommands(params.cwd)
@@ -1060,7 +1243,8 @@ export class PiAcpAgent implements ACPAgent {
       }
     }
 
-    const { configOptions, models, modes } = await getSessionConfiguration(proc)
+    const { configOptions, models, modes } = await getSessionConfiguration(proc, { cwd: params.cwd })
+    const availableCommands = await loadAvailableCommands(proc, fileCommands, enableSkillCommands)
 
     const response = {
       configOptions,
@@ -1073,36 +1257,17 @@ export class PiAcpAgent implements ACPAgent {
       }
     }
 
-    // Advertise slash commands after the response so the client knows the session exists.
     setTimeout(() => {
-      void (async () => {
-        try {
-          const pi = (await proc.getCommands()) as any
-          const { commands } = toAvailableCommandsFromPiGetCommands(pi, {
-            enableSkillCommands,
-            includeExtensionCommands: false
-          })
-
-          await this.conn.sessionUpdate({
-            sessionId: session.sessionId,
-            update: {
-              sessionUpdate: 'available_commands_update',
-              availableCommands: mergeCommands(commands, builtinAvailableCommands())
-            }
-          })
-          return
-        } catch {
-          // fall back
-        }
-
-        await this.conn.sessionUpdate({
+      void session.publishContextUsage()
+      void this.conn
+        .sessionUpdate({
           sessionId: session.sessionId,
           update: {
             sessionUpdate: 'available_commands_update',
-            availableCommands: mergeCommands(toAvailableCommands(fileCommands), builtinAvailableCommands())
+            availableCommands
           }
         })
-      })()
+        .catch(() => {})
     }, 0)
 
     return response
@@ -1138,6 +1303,7 @@ export class PiAcpAgent implements ACPAgent {
     const session = await this.restoreSession(params.sessionId)
     await setSessionModel(session.proc, params.modelId)
     await emitConfigOptionsUpdate(this.conn, session.sessionId, session.proc)
+    if (typeof (session as any).publishContextUsage === 'function') await session.publishContextUsage()
   }
 
   async setSessionMode(params: SetSessionModeRequest): Promise<SetSessionModeResponse> {
@@ -1167,6 +1333,7 @@ export class PiAcpAgent implements ACPAgent {
   async setSessionConfigOption(params: SetSessionConfigOptionRequest): Promise<SetSessionConfigOptionResponse> {
     const session = await this.restoreSession(params.sessionId)
     const configId = String(params.configId)
+    let modelChanged = false
 
     if (typeof params.value !== 'string') {
       throw RequestError.invalidParams(`Expected string value for config option: ${configId}`)
@@ -1174,6 +1341,7 @@ export class PiAcpAgent implements ACPAgent {
 
     if (configId === MODEL_CONFIG_ID) {
       await setSessionModel(session.proc, params.value)
+      modelChanged = true
     } else if (configId === THOUGHT_LEVEL_CONFIG_ID) {
       if (!isThinkingLevel(params.value)) {
         throw RequestError.invalidParams(`Unknown thinking level: ${params.value}`)
@@ -1193,12 +1361,13 @@ export class PiAcpAgent implements ACPAgent {
     }
 
     const configOptions = await emitConfigOptionsUpdate(this.conn, session.sessionId, session.proc)
+    if (modelChanged && typeof (session as any).publishContextUsage === 'function') await session.publishContextUsage()
     return { configOptions }
   }
 }
 
 function isThinkingLevel(x: string): x is ThinkingLevel {
-  return x === 'off' || x === 'minimal' || x === 'low' || x === 'medium' || x === 'high' || x === 'xhigh'
+  return x === 'off' || x === 'minimal' || x === 'low' || x === 'medium' || x === 'high' || x === 'xhigh' || x === 'max'
 }
 
 async function getThinkingState(
@@ -1228,7 +1397,19 @@ async function getThinkingState(
   const tl = typeof state?.thinkingLevel === 'string' ? state.thinkingLevel : null
   if (tl && isThinkingLevel(tl)) current = tl
 
-  const available: ThinkingLevel[] = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh']
+  let available: ThinkingLevel[] = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max']
+  try {
+    const maybe = proc as unknown as { getAvailableThinkingLevels?: () => Promise<string[]> }
+    if (typeof maybe.getAvailableThinkingLevels === 'function') {
+      const levels = await maybe.getAvailableThinkingLevels()
+      if (Array.isArray(levels) && levels.length) {
+        const filtered = levels.filter(isThinkingLevel)
+        available = (filtered.length ? filtered : levels) as ThinkingLevel[]
+      }
+    }
+  } catch {
+    // fallback to hardcoded list
+  }
 
   return {
     currentModeId: current,
@@ -1242,7 +1423,7 @@ async function getThinkingState(
 
 async function getSessionConfiguration(
   proc: PiRpcProcess,
-  pre?: { state?: any | null; availableModels?: any | null }
+  pre?: { state?: any | null; availableModels?: any | null; cwd?: string }
 ): Promise<{
   configOptions: SessionConfigOption[]
   models: {
@@ -1256,14 +1437,18 @@ async function getSessionConfiguration(
       description?: string | null
     }>
     currentModeId: string
-  }
+  } | null
 }> {
-  const [models, modes] = await Promise.all([getModelState(proc, pre), getThinkingState(proc, { state: pre?.state })])
-
+  const [models, modes] = await Promise.all([
+    getModelState(proc, pre, pre?.cwd),
+    getThinkingState(proc, { state: pre?.state })
+  ])
+  const configOptions = buildConfigOptions({ models, modes })
+  const hasThoughtLevel = configOptions.some(o => o.id === THOUGHT_LEVEL_CONFIG_ID)
   return {
-    configOptions: buildConfigOptions({ models, modes }),
+    configOptions,
     models,
-    modes
+    modes: hasThoughtLevel ? null : modes
   }
 }
 
@@ -1318,7 +1503,8 @@ function buildConfigOptions(state: {
 
 async function getModelState(
   proc: PiRpcProcess,
-  pre?: { state?: any | null; availableModels?: any | null }
+  pre?: { state?: any | null; availableModels?: any | null },
+  cwd?: string
 ): Promise<{
   availableModels: AdvertisedModel[]
   currentModelId: string
@@ -1351,6 +1537,33 @@ async function getModelState(
       } satisfies AdvertisedModel
     })
     .filter(Boolean) as AdvertisedModel[]
+
+  // Respect enabledModels filter from pi settings (global + project merge)
+  const effectiveCwd =
+    cwd ??
+    (() => {
+      try {
+        return process.cwd()
+      } catch {
+        return ''
+      }
+    })()
+  if (effectiveCwd) {
+    const enabled = getEnabledModels(effectiveCwd)
+    if (enabled && enabled.length) {
+      const lower = enabled.map(s => s.toLowerCase())
+      const filtered = availableModels.filter(m => {
+        const modelIdLower = m.modelId.toLowerCase()
+        const idOnly = m.modelId.split('/').pop()!.toLowerCase()
+        return (
+          lower.includes(modelIdLower) ||
+          lower.includes(idOnly) ||
+          lower.some(p => modelIdLower.includes(p.toLowerCase()))
+        )
+      })
+      if (filtered.length) availableModels = filtered
+    }
+  }
 
   // Ask pi what model is currently active.
   let currentModelId: string | null = null
@@ -1402,35 +1615,28 @@ async function emitConfigOptionsUpdate(
 }
 
 async function setSessionModel(proc: PiRpcProcess, requestedModelId: string): Promise<void> {
-  // Accept either:
-  //  - "provider/model" (preferred, matches how we advertise)
-  //  - "model" (fallback, resolve via available models)
-  let provider: string | null = null
-  let modelId: string | null = null
+  // Either half may contain a slash — model ids like "google/gemma-3-12b" are
+  // common, and a provider id is whatever the extension registering it chose —
+  // so resolve against the catalog rather than guessing where the split falls.
+  const data = (await proc.getAvailableModels()) as any
+  const models: any[] = Array.isArray(data?.models) ? data.models : []
+  const found =
+    models.find(m => `${String(m?.provider ?? '')}/${String(m?.id ?? '')}` === requestedModelId) ??
+    models.find(m => String(m?.id ?? '') === requestedModelId)
 
-  if (requestedModelId.includes('/')) {
-    const [candidateProvider, ...rest] = requestedModelId.split('/')
-    provider = candidateProvider
-    modelId = rest.join('/')
-  } else {
-    modelId = requestedModelId
+  if (found) {
+    await proc.setModel(String(found.provider), String(found.id))
+    return
   }
 
-  if (!provider) {
-    const data = (await proc.getAvailableModels()) as any
-    const models: any[] = Array.isArray(data?.models) ? data.models : []
-    const found = models.find(m => String(m?.id) === modelId)
-    if (found) {
-      provider = String(found.provider)
-      modelId = String(found.id)
-    }
-  }
-
-  if (!provider || !modelId) {
+  // Not advertised by pi. Split at the first slash so the rejection still comes
+  // from pi rather than from a guess made here.
+  const separator = requestedModelId.indexOf('/')
+  if (separator < 1) {
     throw RequestError.invalidParams(`Unknown modelId: ${requestedModelId}`)
   }
 
-  await proc.setModel(provider, modelId)
+  await proc.setModel(requestedModelId.slice(0, separator), requestedModelId.slice(separator + 1))
 }
 
 function isSemver(v: string): boolean {
@@ -1457,10 +1663,15 @@ function compareSemver(a: string, b: string): number {
 }
 
 function buildUpdateNotice(): string | null {
+  if (process.env.PI_ACP_CHECK_FOR_UPDATES === 'false') return null
   // Best-effort update check against npm registry.
   // Important: keep it fast to not slow down session/new.
   try {
-    const piVersion = spawnSync('pi', ['--version'], { encoding: 'utf-8' })
+    const piCmd = getPiCommand(process.env.PI_ACP_PI_COMMAND)
+    const piVersion = spawnSync(piCmd, ['--version'], {
+      encoding: 'utf-8',
+      shell: piCmd.endsWith('.cmd') || piCmd.endsWith('.bat')
+    })
     const installed = (String(piVersion.stdout ?? '').trim() || String(piVersion.stderr ?? '').trim()).replace(
       /^v/i,
       ''
@@ -1489,6 +1700,7 @@ function buildStartupInfo(opts: {
   cwd: string
   fileCommands: ReturnType<typeof loadSlashCommands>
   updateNotice: string | null
+  additionalDirectories?: string[]
 }): string {
   void opts.fileCommands
 
@@ -1496,7 +1708,11 @@ function buildStartupInfo(opts: {
 
   // pi version header
   try {
-    const piVersion = spawnSync('pi', ['--version'], { encoding: 'utf-8' })
+    const piCmd = getPiCommand(process.env.PI_ACP_PI_COMMAND)
+    const piVersion = spawnSync(piCmd, ['--version'], {
+      encoding: 'utf-8',
+      shell: piCmd.endsWith('.cmd') || piCmd.endsWith('.bat')
+    })
     const installed = (String(piVersion.stdout ?? '').trim() || String(piVersion.stderr ?? '').trim()).replace(
       /^v/i,
       ''
@@ -1524,6 +1740,8 @@ function buildStartupInfo(opts: {
   const contextPath = join(opts.cwd, 'AGENTS.md')
   if (existsSync(contextPath)) contextItems.push(contextPath)
   addSection('Context', contextItems)
+
+  addSection('Additional workspace roots', opts.additionalDirectories ?? [])
 
   // Skills
   const skillsItems: string[] = []
@@ -1589,6 +1807,9 @@ function buildStartupInfo(opts: {
   const projectSkillsDir = join(opts.cwd, '.pi', 'skills')
   pushSkillFromRoot(projectSkillsDir)
 
+  const customSkillsDir = process.env.PI_SKILLS_DIR?.trim() || process.env.PI_AGENT_SKILLS_DIR?.trim()
+  if (customSkillsDir) pushSkillFromRoot(customSkillsDir)
+
   addSection('Skills', skillsItems)
 
   // Prompts
@@ -1617,21 +1838,25 @@ function buildStartupInfo(opts: {
   for (const settingsPath of settingsPaths) {
     try {
       const settings = JSON.parse(readFileSync(settingsPath, 'utf-8')) as any
-      const pkgs: string[] = Array.isArray(settings?.packages) ? settings.packages : []
+      const pkgs: unknown[] = Array.isArray(settings?.packages) ? settings.packages : []
       for (const pkg of pkgs) {
-        const s = String(pkg)
-        if (s.startsWith('npm:')) {
-          extItems.push(`${s}\n  - index.ts`)
-        } else {
-          extItems.push(s)
-        }
+        let name: string
+        if (typeof pkg === 'string') name = pkg
+        else if (pkg && typeof pkg === 'object') {
+          const o = pkg as any
+          name = String(o.name ?? o.package ?? o.id ?? JSON.stringify(o))
+        } else name = String(pkg)
+        extItems.push(name)
       }
     } catch {
       // ignore
     }
   }
 
-  addSection('Extensions', extItems)
+  // Dedupe and keep stable order, truncate long lists
+  const dedupedExt = [...new Set(extItems)]
+  const displayExt = dedupedExt.length > 8 ? [...dedupedExt.slice(0, 7), `+${dedupedExt.length - 7} more`] : dedupedExt
+  addSection('Extensions', displayExt)
 
   if (opts.updateNotice) {
     md.push('---')

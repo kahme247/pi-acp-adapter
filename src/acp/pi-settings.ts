@@ -36,8 +36,16 @@ function getMergedSettings(cwd: string): Record<string, unknown> {
   return deepMerge(global, project)
 }
 
+function expandTilde(p: string): string {
+  if (p === '~') return homedir()
+  if (p.startsWith('~/')) return join(homedir(), p.slice(2))
+  return p
+}
+
 export function getAgentDir(): string {
-  return process.env.PI_CODING_AGENT_DIR ? resolve(process.env.PI_CODING_AGENT_DIR) : join(homedir(), '.pi', 'agent')
+  const raw = process.env.PI_CODING_AGENT_DIR
+  if (!raw) return join(homedir(), '.pi', 'agent')
+  return resolve(expandTilde(raw))
 }
 
 /**
@@ -72,4 +80,12 @@ export function getQuietStartup(cwd: string): boolean {
   if (typeof legacy === 'boolean') return legacy
 
   return false
+}
+
+export function getEnabledModels(cwd: string): string[] | null {
+  const merged = getMergedSettings(cwd)
+  const raw = (merged as any).enabledModels
+  if (!Array.isArray(raw) || raw.length === 0) return null
+  const list = raw.map((v: unknown) => String(v).trim()).filter(Boolean)
+  return list.length ? list : null
 }

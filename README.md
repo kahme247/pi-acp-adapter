@@ -1,8 +1,8 @@
-# pi-acp
+# pi-acp-adapter
 
-ACP ([Agent Client Protocol](https://agentclientprotocol.com/overview/introduction)) adapter for [`pi`](https://github.com/earendil-works/pi) coding agent (fka shitty coding agent).
+ACP ([Agent Client Protocol](https://agentclientprotocol.com/overview/introduction)) adapter for [`pi`](https://github.com/earendil-works/pi) coding agent (fka shitty coding agent) — formerly `pi-acp` / `pi-agent`.
 
-`pi-acp` communicates **ACP JSON-RPC 2.0 over stdio** to an ACP client (e.g. Zed editor) and spawns `pi --mode rpc`, bridging requests/events between the two.
+`pi-acp-adapter` (binary aliases: `pi-acp`, `pi-agent`) communicates **ACP JSON-RPC 2.0 over stdio** to an ACP client (e.g. Zed editor) and spawns `pi --mode rpc`, bridging requests/events between the two.
 
 ## Status
 
@@ -26,6 +26,7 @@ Expect some minor breaking changes.
   - Adds a small set of built-in commands for headless/editor usage
   - Supports skill commands (if enabled in pi settings, they appear as `/skill:skill-name` in the ACP client)
 - Skills are loaded by pi directly and are available in ACP sessions
+- MCP servers from the ACP client (`session/new` / `session/load` `mcpServers`) are connected per session and their tools are exposed to pi (see [MCP servers](#mcp-servers))
 - (Zed) `pi-acp` emits “startup info” block into the session (pi version, context, skills, prompts, extensions - similar to `pi` in the terminal). You can disable it by setting `quietStartup: true` in pi settings (`~/.pi/agent/settings.json` or `<project>/.pi/settings.json`). When `quietStartup` is enabled, `pi-acp` will still emit a 'New version available' message if the installed pi version is outdated.
 - (Zed) Session history is supported in Zed starting with [`v0.225.0`](https://zed.dev/releases/preview/0.225.0). Session loading / history maps to pi's session files. Sessions can be resumed both in `pi` and in the ACP client.
 
@@ -38,7 +39,7 @@ npm install -g @earendil-works/pi-coding-agent
 ```
 
 - Node.js 22+
-- `pi` v0.80.4+ installed and available on your `PATH` (the adapter runs the `pi` executable)
+- `pi` v0.84.4+ installed and available on your `PATH` (the adapter runs the `pi` executable)
 - Configure `pi` separately for your model providers/API keys
 
 ## Install
@@ -66,7 +67,7 @@ Add the following to your Zed `settings.json`:
     "pi": {
       "type": "custom",
       "command": "npx",
-      "args": ["-y", "pi-acp"],
+      "args": ["-y", "pi-acp-adapter"],
       "env": {}
     }
   }
@@ -75,14 +76,14 @@ Add the following to your Zed `settings.json`:
 #### Global install
 
 ```bash
-npm install -g pi-acp
+npm install -g pi-acp-adapter
 ```
 
 ```json
   "agent_servers": {
     "pi": {
       "type": "custom",
-      "command": "pi-acp",
+      "command": "pi-acp-adapter",
       "args": [],
       "env": {}
     }
@@ -114,6 +115,8 @@ Point your ACP client to the built `dist/index.js`:
 - `PI_ACP_ENABLE_EMBEDDED_CONTEXT=true` advertises ACP `promptCapabilities.embeddedContext` support to the client.
 - Default: unset/any other value means `false`.
 - When disabled, compliant ACP clients should avoid sending embedded `resource` blocks. If they send them anyway, `pi-acp` still degrades gracefully by converting them into plain-text prompt context.
+- `PI_ACP_DATA_DIR` overrides the default location for pi-acp's own data directory (default: `~/.pi/pi-acp`). This controls where the session-map file and any future adapter-owned data is stored. Separate from `PI_CODING_AGENT_DIR`, which rehomes pi's own agent directory.
+- `PI_ACP_CHECK_FOR_UPDATES=false` disables the npm update check on session startup. By default the check runs (fast, 800ms timeout).
 
 You can add the environment variable in the Zed settings with:
 
@@ -165,6 +168,14 @@ Other built-in commands:
 
 **Note**: Slash commands provided by pi extensions are not currently supported.
 
+## MCP servers
+
+`mcpServers` sent by the ACP client on `session/new` (and `session/load`) are handed to the spawned pi process: the adapter passes each session's servers to pi through a bundled bridge extension (`-e` on the pi command line, servers carried in that session's process env — one pi process per session makes this per-session safe).
+
+The bridge opens one MCP client per server (`stdio` command servers, as well as `http` and `sse` URLs — the adapter advertises `mcpCapabilities: { http: true, sse: true }`) and registers every tool on pi as `<server>_<tool>`, so the model can call them like any other pi tool. A server that fails to connect reports itself in the transcript without affecting the others.
+
+The unstable ACP-channel transport (`type: "acp"`) is not supported. For pi-wide MCP servers configured outside ACP (e.g. via [pi-mcp-adapter](https://github.com/nicobailon/pi-mcp-adapter)), pi loads them itself as usual; they are available in ACP sessions independently of this wiring.
+
 ## Authentication (ACP Registry support)
 
 This agent supports **Terminal Auth** for the [ACP Registry](https://agentclientprotocol.com/get-started/registry).
@@ -172,7 +183,7 @@ In Zed, this will show an **Authenticate** banner that launches pi in a terminal
 Launch pi in a terminal for interactive login/setup:
 
 ```bash
-pi-acp --terminal-login
+pi-acp-adapter --terminal-login  # aliases: pi-acp, pi-agent
 ```
 
 Your ACP client can also invoke this automatically based on the agent's advertised `authMethods`.

@@ -58,7 +58,7 @@ test('PiAcpAgent: newSession returns configOptions for model and thinking select
     const result = await agent.newSession({ cwd: process.cwd(), mcpServers: [] } as any)
 
     assert.equal(result.models?.currentModelId, 'test/beta')
-    assert.equal(result.modes?.currentModeId, 'high')
+    assert.equal(result.modes, null)
     assert.deepEqual(result.configOptions, [
       {
         type: 'select',
@@ -85,7 +85,8 @@ test('PiAcpAgent: newSession returns configOptions for model and thinking select
           { value: 'low', name: 'Thinking: low', description: null },
           { value: 'medium', name: 'Thinking: medium', description: null },
           { value: 'high', name: 'Thinking: high', description: null },
-          { value: 'xhigh', name: 'Thinking: xhigh', description: null }
+          { value: 'xhigh', name: 'Thinking: xhigh', description: null },
+          { value: 'max', name: 'Thinking: max', description: null }
         ]
       }
     ])

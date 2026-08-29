@@ -9,6 +9,9 @@ export class FakeAgentSideConnection {
   nextPermissionResponse: { outcome: { outcome: 'selected'; optionId: string } | { outcome: 'cancelled' } } = {
     outcome: { outcome: 'selected', optionId: 'allow' }
   }
+  readonly elicitationRequests: unknown[] = []
+  elicitationResponse: any = { action: 'accept', content: { value: 'my answer' } }
+  elicitationError: Error | null = null
 
   async sessionUpdate(msg: SessionUpdateMsg): Promise<void> {
     this.updates.push(msg)
@@ -20,6 +23,12 @@ export class FakeAgentSideConnection {
     this.permissionRequests.push(params)
     return this.nextPermissionResponse
   }
+
+  async unstable_createElicitation(params: any): Promise<any> {
+    this.elicitationRequests.push(params)
+    if (this.elicitationError) throw this.elicitationError
+    return this.elicitationResponse
+  }
 }
 
 export class FakePiRpcProcess {
@@ -27,8 +36,10 @@ export class FakePiRpcProcess {
 
   // spies
   readonly prompts: Array<{ message: string; attachments: unknown[] }> = []
+  readonly steers: Array<{ message: string; images: unknown[] }> = []
   readonly extensionUiResponses: unknown[] = []
   abortCount = 0
+  nextPromptError: Error | null = null
 
   onEvent(handler: (ev: PiRpcEvent) => void): () => void {
     this.handlers.push(handler)
@@ -43,6 +54,23 @@ export class FakePiRpcProcess {
 
   async prompt(message: string, attachments: unknown[] = []): Promise<void> {
     this.prompts.push({ message, attachments })
+    if (this.nextPromptError) {
+      const err = this.nextPromptError
+      this.nextPromptError = null
+      throw err
+    }
+  }
+
+  async steer(message: string, images: unknown[] = []): Promise<void> {
+    this.steers.push({ message, images })
+  }
+
+  async followUp(message: string, images: unknown[] = []): Promise<void> {
+    this.steers.push({ message, images })
+  }
+
+  async clearQueue(): Promise<{ steering: string[]; followUp: string[] }> {
+    return { steering: [], followUp: [] }
   }
 
   async abort(): Promise<void> {
@@ -59,6 +87,14 @@ export class FakePiRpcProcess {
 
   async getAvailableModels(): Promise<any> {
     return { models: [{ provider: 'test', id: 'model', name: 'model' }] }
+  }
+
+  async getSessionStats(): Promise<any> {
+    return {}
+  }
+
+  async getCommands(): Promise<any> {
+    return { commands: [] }
   }
 
   async getMessages(): Promise<any> {

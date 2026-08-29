@@ -1,5 +1,11 @@
+import type { McpServer } from '@agentclientprotocol/sdk'
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
+import { mkdtempSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import * as readline from 'node:readline'
+import { getMcpBridgeExtensionPath } from '../mcp-bridge/extension-path.js'
+import { MCP_SERVERS_ENV } from '../mcp-bridge/servers.js'
 import { getPiCommand, shouldUseShellForPiCommand } from './command.js'
 
 export class PiRpcSpawnError extends Error {
@@ -11,6 +17,13 @@ export class PiRpcSpawnError extends Error {
     this.name = 'PiRpcSpawnError'
     this.code = opts?.code
     ;(this as any).cause = opts?.cause
+  }
+}
+
+export class PiRpcTimeoutError extends Error {
+  constructor(command: string, timeoutMs: number) {
+    super(`pi RPC request timed out after ${timeoutMs}ms: ${command}`)
+    this.name = 'PiRpcTimeoutError'
   }
 }
 
@@ -27,15 +40,22 @@ function stripAnsi(s: string): string {
   return s.replace(ANSI_ESCAPE_REGEX, '')
 }
 
+const RPC_REQUEST_TIMEOUT_MS = 30_000
+const RPC_LONG_REQUEST_TIMEOUT_MS = 10 * 60_000
+
 type PiRpcCommand =
-  | { type: 'prompt'; id?: string; message: string; images?: unknown[] }
+  | { type: 'prompt'; id?: string; message: string; images?: unknown[]; streamingBehavior?: 'steer' | 'followUp' }
+  | { type: 'steer'; id?: string; message: string; images?: unknown[] }
+  | { type: 'follow_up'; id?: string; message: string; images?: unknown[] }
+  | { type: 'clear_queue'; id?: string }
   | { type: 'abort'; id?: string }
   | { type: 'get_state'; id?: string }
   // Model
   | { type: 'get_available_models'; id?: string }
   | { type: 'set_model'; id?: string; provider: string; modelId: string }
   // Thinking
-  | { type: 'set_thinking_level'; id?: string; level: 'off' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' }
+  | { type: 'set_thinking_level'; id?: string; level: 'off' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max' }
+  | { type: 'get_available_thinking_levels'; id?: string }
   // Modes
   | { type: 'set_follow_up_mode'; id?: string; mode: 'all' | 'one-at-a-time' }
   | { type: 'set_steering_mode'; id?: string; mode: 'all' | 'one-at-a-time' }
@@ -51,6 +71,15 @@ type PiRpcCommand =
   | { type: 'get_messages'; id?: string }
   // Commands
   | { type: 'get_commands'; id?: string }
+  // Branching
+  | { type: 'fork'; id?: string; entryId: string }
+  | { type: 'clone'; id?: string }
+  | { type: 'get_entries'; id?: string; since?: string }
+  | { type: 'get_tree'; id?: string }
+  | { type: 'get_fork_messages'; id?: string }
+  | { type: 'get_last_assistant_text'; id?: string }
+  // Bash direct
+  | { type: 'bash'; id?: string; command: string }
 
 type PiRpcResponse = {
   type: 'response'
@@ -68,12 +97,47 @@ type PiExtensionUiResponse =
 
 export type PiRpcEvent = Record<string, unknown>
 
+export const SESSION_STATS_TIMEOUT_MS = 1_000
+
+export type PiContextUsage = {
+  tokens?: number | null
+  contextWindow?: number | null
+}
+
+export type PiSessionStats = {
+  sessionId?: string
+  sessionFile?: string
+  totalMessages?: number
+  cost?: number
+  tokens?: {
+    input?: number
+    output?: number
+    cacheRead?: number
+    cacheWrite?: number
+    total?: number
+  }
+  contextUsage?: PiContextUsage | null
+}
+
 type SpawnParams = {
   cwd: string
   /** Optional override for `pi` executable name/path */
   piCommand?: string
   /** If set, pi will persist the session to this exact file (via `--session <path>`). */
   sessionPath?: string
+  additionalDirectories?: readonly string[]
+  mcpServers?: McpServer[]
+}
+
+export function buildWorkspaceRootsPrompt(cwd: string, dirs: readonly string[]): string {
+  return [
+    '<workspace_roots>',
+    `Primary working directory: ${cwd}`,
+    "Additional workspace roots (also part of the user's workspace):",
+    ...dirs.map(dir => `- ${dir}`),
+    '</workspace_roots>',
+    "The user's workspace spans the primary working directory and the additional workspace roots listed above. Treat files under the additional roots as part of the workspace: read, search, and edit them using absolute paths. Relative paths still resolve against the primary working directory."
+  ].join('\n')
 }
 
 export class PiRpcProcess {
@@ -81,6 +145,9 @@ export class PiRpcProcess {
   private readonly pending = new Map<string, { resolve: (v: PiRpcResponse) => void; reject: (e: unknown) => void }>()
   private eventHandlers: Array<(ev: PiRpcEvent) => void> = []
   private readonly preludeLines: string[] = []
+  private alive = true
+  private bufferedEvents: PiRpcEvent[] = []
+  private eventHandlersAttached = false
 
   private constructor(child: ChildProcessWithoutNullStreams) {
     this.child = child
@@ -101,7 +168,7 @@ export class PiRpcProcess {
 
       if (msg?.type === 'response') {
         const id = typeof msg.id === 'string' ? msg.id : undefined
-        if (id) {
+        if (id !== undefined) {
           const pending = this.pending.get(id)
           if (pending) {
             this.pending.delete(id)
@@ -109,18 +176,25 @@ export class PiRpcProcess {
             return
           }
         }
+        return
       }
 
+      if (!this.eventHandlersAttached) {
+        this.bufferedEvents.push(msg as PiRpcEvent)
+        return
+      }
       for (const h of this.eventHandlers) h(msg as PiRpcEvent)
     })
 
     child.on('exit', (code, signal) => {
+      this.alive = false
       const err = new Error(`pi process exited (code=${code}, signal=${signal})`)
       for (const [, p] of this.pending) p.reject(err)
       this.pending.clear()
     })
 
     child.on('error', err => {
+      this.alive = false
       for (const [, p] of this.pending) p.reject(err)
       this.pending.clear()
     })
@@ -135,12 +209,31 @@ export class PiRpcProcess {
     // Keep extensions + prompt templates enabled because ACP users may rely on them
     // (e.g. MCP extensions, prompt templates for workflows).
     const args = ['--mode', 'rpc', '--no-themes']
+    const extraPiArgs = process.env.PI_ACP_PI_ARGS?.trim() || process.env.PI_ACP_EXTRA_ARGS?.trim()
+    if (extraPiArgs) {
+      const parsed = extraPiArgs.match(/(?:[^\s"']+|"[^"]*"|'[^']*')+/g) ?? []
+      for (const tok of parsed) {
+        const stripped = tok.replace(/^"(.*)"$/, '$1').replace(/^'(.*)'$/, '$1')
+        if (stripped) args.push(stripped)
+      }
+    }
+    let childEnv: NodeJS.ProcessEnv = process.env
+    if (params.mcpServers && params.mcpServers.length > 0) {
+      args.push('-e', getMcpBridgeExtensionPath())
+      childEnv = { ...childEnv, [MCP_SERVERS_ENV]: JSON.stringify(params.mcpServers) }
+    }
     if (params.sessionPath) args.push('--session', params.sessionPath)
+    if (params.additionalDirectories && params.additionalDirectories.length > 0) {
+      const workspaceRootsDir = mkdtempSync(join(tmpdir(), 'pi-acp-'))
+      const promptFile = join(workspaceRootsDir, 'workspace-roots.txt')
+      writeFileSync(promptFile, buildWorkspaceRootsPrompt(params.cwd, params.additionalDirectories), 'utf-8')
+      args.push('--append-system-prompt', shouldUseShellForPiCommand(cmd) ? `"${promptFile}"` : promptFile)
+    }
 
     const child = spawn(cmd, args, {
       cwd: params.cwd,
       stdio: 'pipe',
-      env: process.env,
+      env: childEnv,
       shell: shouldUseShellForPiCommand(cmd)
     })
 
@@ -205,8 +298,19 @@ export class PiRpcProcess {
     return proc
   }
 
+  isAlive(): boolean {
+    return this.alive && !this.child.killed
+  }
+
   onEvent(handler: (ev: PiRpcEvent) => void): () => void {
     this.eventHandlers.push(handler)
+    if (!this.eventHandlersAttached) {
+      this.eventHandlersAttached = true
+      const buffered = this.bufferedEvents.splice(0)
+      for (const ev of buffered) {
+        for (const h of this.eventHandlers) h(ev)
+      }
+    }
     return () => {
       this.eventHandlers = this.eventHandlers.filter(h => h !== handler)
     }
@@ -230,9 +334,32 @@ export class PiRpcProcess {
     return lines
   }
 
-  async prompt(message: string, images: unknown[] = []): Promise<void> {
-    const res = await this.request({ type: 'prompt', message, images })
+  async prompt(message: string, images: unknown[] = [], streamingBehavior?: 'steer' | 'followUp'): Promise<void> {
+    const cmd: PiRpcCommand = streamingBehavior
+      ? { type: 'prompt', message, images, streamingBehavior }
+      : { type: 'prompt', message, images }
+    const res = await this.request(cmd)
     if (!res.success) throw new Error(`pi prompt failed: ${res.error ?? JSON.stringify(res.data)}`)
+  }
+
+  async steer(message: string, images: unknown[] = []): Promise<void> {
+    const res = await this.request({ type: 'steer', message, images })
+    if (!res.success) throw new Error(`pi steer failed: ${res.error ?? JSON.stringify(res.data)}`)
+  }
+
+  async followUp(message: string, images: unknown[] = []): Promise<void> {
+    const res = await this.request({ type: 'follow_up', message, images })
+    if (!res.success) throw new Error(`pi follow_up failed: ${res.error ?? JSON.stringify(res.data)}`)
+  }
+
+  async clearQueue(): Promise<{ steering: string[]; followUp: string[] }> {
+    const res = await this.request({ type: 'clear_queue' })
+    if (!res.success) throw new Error(`pi clear_queue failed: ${res.error ?? JSON.stringify(res.data)}`)
+    const data: any = res.data
+    return {
+      steering: Array.isArray(data?.steering) ? data.steering.map((s: unknown) => String(s)) : [],
+      followUp: Array.isArray(data?.followUp) ? data.followUp.map((s: unknown) => String(s)) : []
+    }
   }
 
   async abort(): Promise<void> {
@@ -258,9 +385,19 @@ export class PiRpcProcess {
     return res.data
   }
 
-  async setThinkingLevel(level: 'off' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh'): Promise<void> {
+  async setThinkingLevel(level: 'off' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max'): Promise<void> {
     const res = await this.request({ type: 'set_thinking_level', level })
     if (!res.success) throw new Error(`pi set_thinking_level failed: ${res.error ?? JSON.stringify(res.data)}`)
+  }
+
+  async getAvailableThinkingLevels(): Promise<string[]> {
+    const res = await this.request({ type: 'get_available_thinking_levels' })
+    if (!res.success)
+      throw new Error(`pi get_available_thinking_levels failed: ${res.error ?? JSON.stringify(res.data)}`)
+    const data: any = res.data
+    if (Array.isArray(data?.levels)) return data.levels.map((l: unknown) => String(l))
+    if (Array.isArray(data)) return data.map((l: unknown) => String(l))
+    return []
   }
 
   async setFollowUpMode(mode: 'all' | 'one-at-a-time'): Promise<void> {
@@ -274,7 +411,7 @@ export class PiRpcProcess {
   }
 
   async compact(customInstructions?: string): Promise<unknown> {
-    const res = await this.request({ type: 'compact', customInstructions })
+    const res = await this.request({ type: 'compact', customInstructions }, { timeoutMs: RPC_LONG_REQUEST_TIMEOUT_MS })
     if (!res.success) throw new Error(`pi compact failed: ${res.error ?? JSON.stringify(res.data)}`)
     return res.data
   }
@@ -284,10 +421,10 @@ export class PiRpcProcess {
     if (!res.success) throw new Error(`pi set_auto_compaction failed: ${res.error ?? JSON.stringify(res.data)}`)
   }
 
-  async getSessionStats(): Promise<unknown> {
-    const res = await this.request({ type: 'get_session_stats' })
+  async getSessionStats(timeoutMs: number = SESSION_STATS_TIMEOUT_MS): Promise<PiSessionStats> {
+    const res = await this.request({ type: 'get_session_stats' }, { timeoutMs })
     if (!res.success) throw new Error(`pi get_session_stats failed: ${res.error ?? JSON.stringify(res.data)}`)
-    return res.data
+    return (res.data ?? {}) as PiSessionStats
   }
 
   async setSessionName(name: string): Promise<void> {
@@ -319,20 +456,77 @@ export class PiRpcProcess {
     return res.data
   }
 
+  async fork(entryId: string): Promise<unknown> {
+    const res = await this.request({ type: 'fork', entryId })
+    if (!res.success) throw new Error(`pi fork failed: ${res.error ?? JSON.stringify(res.data)}`)
+    return res.data
+  }
+
+  async clone(): Promise<unknown> {
+    const res = await this.request({ type: 'clone' })
+    if (!res.success) throw new Error(`pi clone failed: ${res.error ?? JSON.stringify(res.data)}`)
+    return res.data
+  }
+
+  async getEntries(since?: string): Promise<unknown> {
+    const res = await this.request(since ? { type: 'get_entries', since } : { type: 'get_entries' })
+    if (!res.success) throw new Error(`pi get_entries failed: ${res.error ?? JSON.stringify(res.data)}`)
+    return res.data
+  }
+
+  async getTree(): Promise<unknown> {
+    const res = await this.request({ type: 'get_tree' })
+    if (!res.success) throw new Error(`pi get_tree failed: ${res.error ?? JSON.stringify(res.data)}`)
+    return res.data
+  }
+
+  async getForkMessages(): Promise<unknown> {
+    const res = await this.request({ type: 'get_fork_messages' })
+    if (!res.success) throw new Error(`pi get_fork_messages failed: ${res.error ?? JSON.stringify(res.data)}`)
+    return res.data
+  }
+
+  async getLastAssistantText(): Promise<unknown> {
+    const res = await this.request({ type: 'get_last_assistant_text' })
+    if (!res.success) throw new Error(`pi get_last_assistant_text failed: ${res.error ?? JSON.stringify(res.data)}`)
+    return res.data
+  }
+
+  async bash(command: string): Promise<unknown> {
+    const res = await this.request({ type: 'bash', command })
+    if (!res.success) throw new Error(`pi bash failed: ${res.error ?? JSON.stringify(res.data)}`)
+    return res.data
+  }
+
   async sendExtensionUiResponse(response: PiExtensionUiResponse): Promise<void> {
     await this.writeLine(`${JSON.stringify({ type: 'extension_ui_response', ...response })}\n`)
   }
 
-  private request(cmd: PiRpcCommand): Promise<PiRpcResponse> {
+  private request(cmd: PiRpcCommand, opts?: { timeoutMs?: number }): Promise<PiRpcResponse> {
     const id = crypto.randomUUID()
     const withId = { ...cmd, id }
-
+    const timeoutMs = opts?.timeoutMs ?? RPC_REQUEST_TIMEOUT_MS
     const line = `${JSON.stringify(withId)}\n`
-
     return new Promise<PiRpcResponse>((resolve, reject) => {
-      this.pending.set(id, { resolve, reject })
-
+      let timer: ReturnType<typeof setTimeout> | undefined
+      if (timeoutMs > 0) {
+        timer = setTimeout(() => {
+          if (this.pending.delete(id)) {
+            reject(new PiRpcTimeoutError(cmd.type, timeoutMs))
+          }
+        }, timeoutMs)
+      }
+      const wrappedResolve = (v: PiRpcResponse) => {
+        if (timer) clearTimeout(timer)
+        resolve(v)
+      }
+      const wrappedReject = (e: unknown) => {
+        if (timer) clearTimeout(timer)
+        reject(e)
+      }
+      this.pending.set(id, { resolve: wrappedResolve, reject: wrappedReject })
       void this.writeLine(line).catch(error => {
+        if (timer) clearTimeout(timer)
         this.pending.delete(id)
         reject(error)
       })
