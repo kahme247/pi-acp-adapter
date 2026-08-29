@@ -1192,16 +1192,20 @@ export class PiAcpAgent implements ACPAgent {
 
         if (isBash) {
           const text = bashResultText(m)
+          const useTerminal = true
           await this.conn.sessionUpdate({
             sessionId: session.sessionId,
             update: {
               sessionUpdate: 'tool_call',
               toolCallId,
-              title: bashCommand(m) ?? toolName,
+              title: (() => {
+                const t = bashCommand(m) ?? toolName
+                return t.length > 80 ? `${t.slice(0, 80)}…` : t
+              })(),
               kind: 'execute',
               status: 'completed',
-              content: bashTerminalContent(toolCallId),
-              _meta: bashTerminalInfoMeta(toolCallId, params.cwd)
+              ...(useTerminal ? { content: bashTerminalContent(toolCallId) } : {}),
+              ...(useTerminal ? { _meta: bashTerminalInfoMeta(toolCallId, params.cwd) } : {})
             }
           })
 
@@ -1211,10 +1215,14 @@ export class PiAcpAgent implements ACPAgent {
               sessionUpdate: 'tool_call_update',
               toolCallId,
               status: isError ? 'failed' : 'completed',
-              _meta: {
-                ...(text ? bashTerminalOutputMeta(toolCallId, text) : {}),
-                ...bashTerminalExitMeta(toolCallId, bashExitCode(m, isError))
-              }
+              ...(useTerminal
+                ? {
+                    _meta: {
+                      ...(text ? bashTerminalOutputMeta(toolCallId, text) : {}),
+                      ...bashTerminalExitMeta(toolCallId, bashExitCode(m, isError))
+                    }
+                  }
+                : {})
             }
           })
           continue
@@ -1222,12 +1230,19 @@ export class PiAcpAgent implements ACPAgent {
 
         // Create a synthetic ACP tool call to render historic tool usage.
         const expandHistoric = shouldExpandToolCalls()
+        const historicTitle = (() => {
+          const cmd = bashCommand(m)
+          if (cmd) return cmd.length > 80 ? `${cmd.slice(0, 80)}…` : cmd
+          const p = (m as any)?.path ?? (m as any)?.file_path ?? (m as any)?.filePath ?? (m as any)?.input?.path ?? (m as any)?.args?.path
+          if (typeof p === 'string' && p.trim()) return `${toolName}: ${p}`
+          return toolName
+        })()
         await this.conn.sessionUpdate({
           sessionId: session.sessionId,
           update: {
             sessionUpdate: 'tool_call',
             toolCallId,
-            title: toolName,
+            title: historicTitle,
             kind: toolName === 'read' ? 'read' : toolName === 'write' || toolName === 'edit' ? 'edit' : 'other',
             status: 'completed',
             ...(expandHistoric ? { rawInput: null, rawOutput: m } : {})

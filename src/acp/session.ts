@@ -97,9 +97,23 @@ function findUniqueLineNumber(text: string, needle: string): number | undefined 
 }
 
 function getToolPath(args: unknown): string | undefined {
-  const record = args as { path?: unknown; file_path?: unknown } | null | undefined
-  if (typeof record?.path === 'string') return record.path
-  if (typeof record?.file_path === 'string') return record.file_path
+  let value: any = args
+  if (typeof value === 'string') {
+    try { value = JSON.parse(value) } catch { return undefined }
+  }
+  const candidates: unknown[] = [
+    (value as any)?.path,
+    (value as any)?.file_path,
+    (value as any)?.filePath,
+    (value as any)?.args?.path,
+    (value as any)?.args?.file_path,
+    (value as any)?.args?.filePath,
+    (value as any)?.input?.path,
+    (value as any)?.input?.file_path,
+    (value as any)?.toolInput?.path,
+    (value as any)?.details?.path,
+  ]
+  for (const c of candidates) if (typeof c === 'string' && c.trim()) return c
   return undefined
 }
 
@@ -552,15 +566,18 @@ export class PiAcpSession {
     includeTerminal: boolean
   }): void {
     this.bashToolCallIds.add(params.toolCallId)
+    const rawTitle = bashCommand(params.args) ?? params.toolName
+    const title = rawTitle.length > 80 ? `${rawTitle.slice(0, 80)}…` : rawTitle
+    const useTerminal = params.includeTerminal
     this.emit({
       sessionUpdate: params.sessionUpdate,
       toolCallId: params.toolCallId,
-      title: bashCommand(params.args) ?? params.toolName,
+      title,
       kind: 'execute',
       status: params.status,
       locations: params.locations,
-      ...(params.includeTerminal ? { content: bashTerminalContent(params.toolCallId) } : {}),
-      ...(params.includeTerminal ? { _meta: bashTerminalInfoMeta(params.toolCallId, this.cwd) } : {})
+      ...(useTerminal ? { content: bashTerminalContent(params.toolCallId) } : {}),
+      ...(useTerminal ? { _meta: bashTerminalInfoMeta(params.toolCallId, this.cwd) } : {})
     })
   }
 
@@ -575,16 +592,29 @@ export class PiAcpSession {
     const delta = bashOutputDelta(previous, text)
     this.bashOutputSnapshots.set(params.toolCallId, text)
 
+    const useTerminal = this.bashToolCallIds.has(params.toolCallId)
+    if (!useTerminal && params.status === 'in_progress') {
+      this.emit({
+        sessionUpdate: 'tool_call_update',
+        toolCallId: params.toolCallId,
+        status: params.status
+      })
+      return
+    }
     this.emit({
       sessionUpdate: 'tool_call_update',
       toolCallId: params.toolCallId,
       status: params.status,
-      _meta: {
-        ...(delta ? bashTerminalOutputMeta(params.toolCallId, delta) : {}),
-        ...(params.status === 'completed' || params.status === 'failed'
-          ? bashTerminalExitMeta(params.toolCallId, bashExitCode(params.result, Boolean(params.isError)))
-          : {})
-      }
+      ...(useTerminal
+        ? {
+            _meta: {
+              ...(delta ? bashTerminalOutputMeta(params.toolCallId, delta) : {}),
+              ...((params.status === 'completed' || params.status === 'failed'
+                ? bashTerminalExitMeta(params.toolCallId, bashExitCode(params.result, Boolean(params.isError)))
+                : {}) as object)
+            }
+          }
+        : {})
     })
   }
 
@@ -1363,6 +1393,11 @@ function toolDisplayTitle(toolName: string, args: unknown): string {
   const path = getToolPath(args)
   if (path) return `${toolName}: ${path}`
   const cmd = bashCommand(args)
-  if (cmd) return `${toolName}: ${cmd.slice(0, 80)}`
+  if (cmd) return `${toolName}: ${cmd.length > 80 ? `${cmd.slice(0, 80)}…` : cmd}`
+  // fallback for grep/find/ls etc - show first meaningful string arg
+  const v: any = args
+  const raw = typeof v === 'string' ? v : v != null ? JSON.stringify(v) : ''
+  if (raw && raw !== '{}' && raw.length > 2 && raw.length < 120) return `${toolName}: ${raw.slice(0, 80)}`
+  if (raw && raw.length >= 120) return `${toolName}: ${raw.slice(0, 80)}…`
   return toolName
 }
